@@ -53,6 +53,8 @@ parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate.')
 parser.add_argument('--step', type=int, default=0, help='Current step of training (number of minibatches processed).')
 parser.add_argument('--log_interval', type=int, default=50, help='Interval of num batches to show loss statistics.')
 parser.add_argument('--eval_interval', type=int, default=300, help='Interval of num epochs to evaluate, checkpoint, and save samples.')
+# visualize
+parser.add_argument('--n_samples', type=int, default=10, help='Number of samples from validation set to visualize grad-cam on.')
 
 
 # --------------------
@@ -80,6 +82,7 @@ def fetch_dataloader(args, mode):
     transforms = T.Compose([
         T.Resize(args.resize) if args.resize else T.Lambda(lambda x: x),
         T.CenterCrop(320),
+        T.ColorJitter(brightness=0.25, contrast=0.25) if mode=='train' else T.Lambda(lambda x: x),
         T.ToTensor(),
         T.Lambda(lambda x: x.expand(3,-1,-1)),  # expand to 3 channels
         T.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225]) if args.pretrained else T.Lambda(lambda x: x)])
@@ -459,7 +462,7 @@ if __name__ == '__main__':
 
     if args.train:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        if os.path.isfile(args.restore):
+        if args.restore and os.path.isfile(args.restore):
             optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, 'optim_' + args.restore), map_location=args.device))
         train_and_evaluate(model, train_dataloader, valid_dataloader, loss_fn, optimizer, writer, args)
 
@@ -478,7 +481,7 @@ if __name__ == '__main__':
         save_json(eval_metrics, 'eval_ensemble_results', args)
 
     if args.visualize:
-        visualize(model, valid_dataloader, args)
+        visualize(model, valid_dataloader, args, args.n_samples)
 
     if args.plot_roc:
         if 'eval_metrics' not in locals():
