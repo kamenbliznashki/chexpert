@@ -6,7 +6,7 @@ import torch
 import pandas as pd
 
 from chexpert import fetch_dataloader, load_json, densenet121, resnet152
-from dataset import ChexpertSmall
+from dataset import ChexpertSmall, extract_patient_ids
 
 
 # TODO  1. fix defaults for:
@@ -35,11 +35,11 @@ def predict(model, dataloader, args):
     model.eval()
 
     probs, patient_ids = [], []
-    for batch in dataloader:
-        scores = model(batch.img.to(args.device))
+    for x, _, idx in dataloader:
+        scores = model(x.to(args.device))
 
         probs += [scores.sigmoid().cpu()]
-        patient_ids += list(batch.patient_id)
+        patient_ids += extract_patient_ids(dataloader.dataset, idxs)
 
     probs = torch.cat(probs, 0).numpy()
 
@@ -103,9 +103,9 @@ if __name__ == '__main__':
         mode = 'valid'
         dataloader = fetch_dataloader(args, mode)
         targets, patient_ids = [], []
-        for batch in dataloader:
-            targets += [batch.target.cpu()]
-            patient_ids += list(batch.patient_id)
+        for _, target, idxs in dataloader:
+            targets += [target]
+            patient_ids += extract_patient_ids(dataloader.dataset, idxs)
         targets = pd.DataFrame(data=torch.cat(targets, 0).numpy(), index=patient_ids, columns=[*dataloader.dataset.attr_names])
         targets.index.name = 'Study'
         targets = targets.groupby('Study').max()

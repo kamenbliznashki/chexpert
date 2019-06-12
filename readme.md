@@ -8,31 +8,29 @@ To train a model using default batch size, learning:
 ```
 python chexpert.py  --train
                     --data_path         # location of dataset
-                    --model             # choice of densenet121 or resnet152
-                    --pretrained        # flag if pretrained model should be downloaded
+                    --model             # choice of densenet121 or resnet152 or efficientnet-b[0-7]
+                    --pretrained        # flag if pretrained model should be downloaded (only for densenet and resnet)
                     --cuda              # number of cuda device to train on
-                    --eval_interval     # how often to save model checkpoints, visualize and plot results
 ```
 
 To evaluate a single model:
 ```
 python chexpert.py  --evaluate_single_model / evaluate_ensemble
-                    --model             # choice of densenet121 or resnet152 of the saved model
+                    --model             # architecture of the saved model
                     --data_path         # location of dataset
-                    --output_dir        # folder where experiment results are saved
-                    --restore           # if evaluate_single_model - filename relative to output_dir of the saved model checkpoint,
-                                          if evaluate_ensemble, folder relative to output_dir where checkpoints are saved
-                    --plot_roc          # flag to also plot ROC and PR curves
+                    --output_dir        # folder where experiment results and tensorboard tracking are saved
+                    --restore           # if evaluate_single_model - file path to the saved model checkpoint,
+                                          if evaluate_ensemble - folder path to the directory where checkpoints are saved
+                    --plot_roc          # flag whether to also plot ROC and PR curves
 ```
 
-To visualize class activation mappings from validation set:
+To visualize class activation mappings from the validation set (saves a grid of model probabilities, original image, and grad-cam visualization for 3 examples for each condition singularly present, 2 present conditions, >2 present conditions, and no present conditions; example below):
 ```
 python chexpert.py  --visualize
                     --model             # choice of densenet121 or resnet152 of the saved model
                     --data_path         # location of dataset
                     --output_dir        # folder where experiment results are saved
-                    --restore           # filename relative to output_dir of the saved model checkpoint
-                    --n_samples         # number of samples from validation set to visualize
+                    --restore           # file path to the saved model checkpoint
 ```
 
 ### Results
@@ -46,6 +44,8 @@ Models were trained with the hyperparameters described in the paper (Training Pr
 | densenet121_baseline | 0.847 | 0.845	| 0.912 | 0.905 | 0.938 |
 | densenet121_pretrained | 0.847 | 0.859 | 0.900 | 0.936 | 0.940 |
 | densenet121_pretrained_data_aug | 0.849 | 0.859 | 0.902 |	0.932 | 0.943 |
+| efficientnet-b0_data_aug | 0.857 | 0.852 | 0.903 | 0.890 | 0.932 |
+| efficientnet-b4_data_aug	| 0.851	| 0.844 | 0.904 | 0.890 | 0.928 |
 | resnet152_baseline | 0.861 | 0.852 | 0.908 | 0.894 | 0.919 |
 | resnet152_pretrained | 0.849 | 0.859 | 0.916 | 0.934 | 0.944 |
 
@@ -55,11 +55,21 @@ Models were trained with the hyperparameters described in the paper (Training Pr
 ![densent121_plot](images/densenet121_pretrained_data_aug_roc_pr_step_ensemble.png)
 
 
-##### Findings localization using Gradient-weighted Class Activation Mappings:
+##### Examples of findings localization using Gradient-weighted Class Activation Mappings using DenseNet121_pretrained:
 
-In the predictions table below, `GT` refers to ground truth, `Pred. prob` refers to model prediction probability (uncalibrated).
+In the predictions tables below, `Pred. prob` refers to model prediction probability (uncalibrated).
 
-![densenet121_gradcam](images/densenet121_pretrained_data_aug_vis_CheXpert-v1.0-small-valid-patient64545-study1_view_5_trainstep_41700.png)
+###### Pleural Effusion only
+
+![densenet121_gradcam](images/densenet121_pretrained_vis_Pleural_Effusion_step_41700.png)
+
+###### No findings
+
+![densenet121_gradcam](images/densenet121_pretrained_vis_No_findings_step_41700.png)
+
+###### Multiple findings
+
+![densenet121_gradcam](images/densenet121_pretrained_vis_Multiple_conditions_step_41700.png)
 
 ### Dependencies
 * python 3.5+

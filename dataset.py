@@ -48,16 +48,16 @@ class ChexpertSmall(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        # 2. save patient_id for prediction/eval results as 'CheXpert-v1.0-small/valid/patient64541/study1'
-        #    extract from img_path = 'CheXpert-v1.0-small/valid/patient64541/study1/view1_frontal.jpg'
-        #    NOTE -- patient_id is non-unique as there can be multiple views
-        patient_id = '/'.join(img_path.split('/')[:4])
+        # 2. save index for extracting the patient_id in prediction/eval results as 'CheXpert-v1.0-small/valid/patient64541/study1'
+        patient_id = torch.tensor(idx)
 
         # 3. for train and valid, select attributes as targets
-        attr = None
+        # NOTE attr is a vector of 0s under the test
+        attr = torch.zeros(len(self.attr_names))
         if self.mode in ['train', 'valid']:
             attr = self.data[self.attr_names].iloc[idx].values
-            attr = torch.from_numpy(attr).float()
+#            attr = torch.from_numpy(attr).float()
+            attr = torch.tensor(attr).float()
 
         return img, attr, patient_id
 
@@ -124,6 +124,13 @@ class ChexpertSmall(Dataset):
                 json.dump(data_filter, f)
 
         return train_df
+
+
+def extract_patient_ids(dataset, idxs):
+    # extract a list of patient_id for prediction/eval results as ['CheXpert-v1.0-small/valid/patient64541/study1', ...]
+    #    extract from image path = 'CheXpert-v1.0-small/valid/patient64541/study1/view1_frontal.jpg'
+    #    NOTE -- patient_id is non-unique as there can be multiple views under the same study
+    return dataset.data['Path'].iloc[idxs].str.rsplit('/', expand=True, n=1)[0].values
 
 
 if __name__ == '__main__':
