@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 import numpy as np
 import matplotlib
@@ -23,6 +23,7 @@ from functools import partial
 from dataset import ChexpertSmall, extract_patient_ids
 from torchvision.models import densenet121, resnet152
 from models.efficientnet import construct_model
+from models.attn_aug_conv import DenseNet, ResNet, Bottleneck
 
 
 parser = argparse.ArgumentParser()
@@ -42,16 +43,15 @@ parser.add_argument('--restore', type=str, help='Path to a single model checkpoi
 # model architecture
 parser.add_argument('--model', default='densenet121', help='What model architecture to use. (densenet121, resnet152, efficientnet-b[0-7])')
 # data params
-parser.add_argument('--mini_data', type=int, help='Truncate dataset to first entry only.')
+parser.add_argument('--mini_data', type=int, help='Truncate dataset to this number of examples.')
 parser.add_argument('--resize', type=int, help='Size of minimum edge to which to resize images.')
 # training params
 parser.add_argument('--pretrained', action='store_true', help='Use ImageNet pretrained model and normalize data mean and std.')
 parser.add_argument('--batch_size', type=int, default=16, help='Dataloaders batch size.')
 parser.add_argument('--n_epochs', type=int, default=1, help='Number of epochs to train.')
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate.')
-parser.add_argument('--lr_mode', type=str, default='constant', help='Mode for lr scheduler, e.g. constant or exponential.')
-parser.add_argument('--lr_warmup_steps', type=float, default=500, help='Linear warmup of the learning rate for lr_warmup_steps number of steps.')
-parser.add_argument('--lr_decay_steps', type=float, default=500, help='Decay learning rate stepwise every lr_decay_steps number of steps.')
+parser.add_argument('--lr_warmup_steps', type=float, default=0, help='Linear warmup of the learning rate for lr_warmup_steps number of steps.')
+parser.add_argument('--lr_decay_factor', type=float, default=0.97, help='Decay factor if exponential learning rate decay scheduler.')
 parser.add_argument('--step', type=int, default=0, help='Current step of training (number of minibatches processed).')
 parser.add_argument('--log_interval', type=int, default=50, help='Interval of num batches to show loss statistics.')
 parser.add_argument('--eval_interval', type=int, default=300, help='Interval of num epochs to evaluate, checkpoint, and save samples.')
@@ -62,14 +62,14 @@ parser.add_argument('--eval_interval', type=int, default=300, help='Interval of 
 # --------------------
 
 def fetch_dataloader(args, mode):
+    assert mode in ['train', 'valid', 'vis']
 
     transforms = T.Compose([
         T.Resize(args.resize) if args.resize else T.Lambda(lambda x: x),
         T.CenterCrop(320),
-        T.ColorJitter(brightness=0.25, contrast=0.25) if mode=='train' else T.Lambda(lambda x: x),
         T.ToTensor(),
-        T.Lambda(lambda x: x.expand(3,-1,-1)),  # expand to 3 channels
-        T.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225]) if args.pretrained else T.Lambda(lambda x: x)])
+        T.Normalize(mean=[0.5330], std=[0.0349]),   # whiten with dataset mean and std
+        T.Lambda(lambda x: x.expand(3,-1,-1))])     # expand to 3 channels
 
     dataset = ChexpertSmall(args.data_path, mode, transforms, mini_data=args.mini_data)
 
@@ -128,8 +128,6 @@ def save_checkpoint(checkpoint, optim_checkpoint, sched_checkpoint, args, max_re
 # --------------------
 
 def compute_metrics(outputs, targets, losses):
-    outputs, targets, losses = outputs.cpu(), targets.cpu(), losses.cpu()
-
     n_classes = outputs.shape[1]
     fpr, tpr, aucs, precision, recall = {}, {}, {}, {}, {}
     for i in range(n_classes):
@@ -158,15 +156,13 @@ def train_epoch(model, train_dataloader, valid_dataloader, loss_fn, optimizer, s
         for x, target, idxs in train_dataloader:
             args.step += 1
 
-            x, target = x.to(args.device), target.to(args.device)
-
-            out = model(x)
-            loss = loss_fn(out, target).sum(1).mean(0)
+            out = model(x.to(args.device))
+            loss = loss_fn(out, target.to(args.device)).sum(1).mean(0)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if scheduler: scheduler.step()
+            if scheduler and args.step >= args.warmup_steps: scheduler.step()
 
             pbar.set_postfix(loss = '{:.4f}'.format(loss.item()))
             pbar.update()
@@ -183,21 +179,18 @@ def train_epoch(model, train_dataloader, valid_dataloader, loss_fn, optimizer, s
 
                     eval_metrics = evaluate_single_model(model, valid_dataloader, loss_fn, args)
 
-                    writer.add_scalar('eval_loss', np.mean(list(eval_metrics['loss'].values())), args.step)
+                    writer.add_scalar('eval_loss', np.sum(list(eval_metrics['loss'].values())), args.step)
                     for k, v in eval_metrics['aucs'].items():
                         writer.add_scalar('eval_auc_class_{}'.format(k), v, args.step)
 
                     # save model
                     save_checkpoint(checkpoint={'global_step': args.step,
-                                                'eval_loss': np.mean(list(eval_metrics['loss'].values())),
+                                                'eval_loss': np.sum(list(eval_metrics['loss'].values())),
                                                 'avg_auc': np.nanmean(list(eval_metrics['aucs'].values())),
                                                 'state_dict': model.state_dict()},
                                     optim_checkpoint=optimizer.state_dict(),
                                     sched_checkpoint=scheduler.state_dict() if scheduler else None,
                                     args=args)
-
-                    # visualize grad-cam and plot roc
-                    visualize(model, valid_dataloader, args)
 
                     # switch back to train mode
                     model.train()
@@ -208,16 +201,14 @@ def evaluate(model, dataloader, loss_fn, args):
 
     targets, outputs, losses = [], [], []
     for x, target, idxs in dataloader:
-        x, target = x.to(args.device), target.to(args.device)
+        out = model(x.to(args.device))
+        loss = loss_fn(out, target.to(args.device))
 
-        out = model(x)
-        loss = loss_fn(out, target)
-
-        outputs += [out]
+        outputs += [out.cpu()]
         targets += [target]
-        losses  += [loss]
+        losses  += [loss.cpu()]
 
-    return torch.cat(outputs, 0), torch.cat(targets, 0), torch.cat(losses, 0)
+    return torch.cat(outputs), torch.cat(targets), torch.cat(losses)
 
 def evaluate_single_model(model, dataloader, loss_fn, args):
     outputs, targets, losses = evaluate(model, dataloader, loss_fn, args)
@@ -232,6 +223,7 @@ def evaluate_ensemble(model, dataloader, loss_fn, args):
         # load weights
         model_checkpoint = torch.load(os.path.join(args.restore, checkpoint), map_location=args.device)
         model.load_state_dict(model_checkpoint['state_dict'])
+        del model_checkpoint
         # evaluate
         outputs_, targets, losses_ = evaluate(model, dataloader, loss_fn, args)
         outputs += [outputs_]
@@ -254,28 +246,12 @@ def train_and_evaluate(model, train_dataloader, valid_dataloader, loss_fn, optim
         print('Evaluate metrics @ step {}:'.format(args.step))
         print('AUC:\n', pprint.pformat(eval_metrics['aucs']))
         print('Loss:\n', pprint.pformat(eval_metrics['loss']))
-        writer.add_scalar('eval_loss', np.mean(list(eval_metrics['loss'].values())), args.step)
+        writer.add_scalar('eval_loss', np.sum(list(eval_metrics['loss'].values())), args.step)
         for k, v in eval_metrics['aucs'].items():
             writer.add_scalar('eval_auc_class_{}'.format(k), v, args.step)
 
         # save eval metrics
         save_json(eval_metrics, 'eval_results_step_{}'.format(args.step), args)
-
-# --------------------
-# Training helper functions
-# --------------------
-
-def build_lr(step, mode='exponential', decay_steps=500, warmup_steps=500, decay_factor=0.97):
-    # provides the multiplicative factor to LambdaLR scheduler, which then returns initial_lr * factor to the optimizer
-    if warmup_steps and step < warmup_steps:
-        return step / warmup_steps
-
-    if mode=='constant':
-        return 1
-    elif mode=='exponential':
-        return decay_factor ** (step // decay_steps)  # staircase decay (cf tf.train.exponential_decay)
-    else:
-        raise RuntimeError('Invalid learning rate scheduling mode.')
 
 # --------------------
 # Visualization
@@ -292,18 +268,13 @@ def grad_cam(model, x, hooks, cls_idx=None):
 
     # register backward hooks
     conv_features, linear_grad = [], []
-    #model.features.denseblock4.denselayer16.conv2.register_forward_hook(lambda module, in_tensor, out_tensor: conv_features.append(out_tensor))
     forward_handle = hooks['forward'].register_forward_hook(lambda module, in_tensor, out_tensor: conv_features.append(out_tensor))
     backward_handle = hooks['backward'].register_backward_hook(lambda module, grad_input, grad_output: linear_grad.append(grad_input))
 
     # run model forward and create a one hot output for the given cls_idx or max class
     outputs = model(x)
-
-    if not cls_idx:
-        cls_idx = outputs.argmax(1)
-    one_hot = torch.zeros_like(outputs)
-    one_hot[torch.arange(outputs.shape[0]), cls_idx] = 1
-    one_hot.requires_grad_(True)
+    if not cls_idx: cls_idx = outputs.argmax(1)
+    one_hot = F.one_hot(cls_idx, outputs.shape[1]).float().requires_grad_(True)
 
     # run model backward
     one_hot.mul(outputs).sum().backward()
@@ -324,50 +295,42 @@ def grad_cam(model, x, hooks, cls_idx=None):
 
     cam = F.interpolate(cam, x.shape[2:], mode='bilinear', align_corners=True)
 
+    # cleanup
     forward_handle.remove()
     backward_handle.remove()
     model.zero_grad()
 
     return cam
 
-
-def visualize(model, dataloader, args):
-    """ visualize 3 examples from each condition category + no finding category + multiple conditions category """
-    # 1. get data idxs where only the current attr is present and other conditions are not; return list of lists
-    idxs = []
-    data = dataloader.dataset.data
+def visualize(model, dataloader, grad_cam_hooks, args):
     attr_names = dataloader.dataset.attr_names
-    for attr in attr_names:
-        idxs.append(data.loc[(data[attr]==1) & (data[attr_names].sum(1)==1), attr_names].head(3).index.tolist())
-    idxs.append(data.loc[data[attr_names].sum(1)==0, attr_names].head(3).index.tolist())  # no findings category
-    idxs.append(data.loc[data[attr_names].sum(1)==2, attr_names].head(3).index.tolist())  # 2 cnditions category
-    idxs.append(data.loc[data[attr_names].sum(1)>2, attr_names].head(3).index.tolist())   # >2 conditions category
 
-    # 2. load all the data into a batch
-    idxs_flatten = [i for sublist in idxs for i in sublist]
-    imgs, labels, _ = dataloader.collate_fn([dataloader.dataset[idx] for idx in idxs_flatten])
-    patient_ids = extract_patient_ids(dataloader.dataset, idxs_flatten)
+    # 1. run through model to compute logits and grad-cam
+    imgs, labels, scores, masks, idxs = [], [], [], [], []
+    for x, target, idx in dataloader:
+        imgs += [x]
+        labels += [target]
+        idxs += idx.tolist()
+        x = x.to(args.device)
+        scores += [model(x).cpu()]
+        masks  += [grad_cam(model, x, grad_cam_hooks).cpu()]
+    imgs, labels, scores, masks = torch.cat(imgs), torch.cat(labels), torch.cat(scores), torch.cat(masks)
 
-    # 3. run through model to compute logits and grad-cam
-    scores = model(imgs.to(args.device))
-    masks = grad_cam(model, imgs.to(args.device), args.hooks)
+    # 2. renormalize images and convert everything to numpy for matplotlib
+    imgs.mul_(0.0349).add_(0.5330)
+    imgs = imgs.permute(0,2,3,1).data.numpy()
+    labels = labels.data.numpy()
+    patient_ids = extract_patient_ids(dataloader.dataset, idxs)
+    masks = masks.permute(0,2,3,1).data.numpy()
+    probs = scores.sigmoid().data.numpy()
 
-    # 4. renormalize images if using a pretrained model, move everything to cpu and convert to numpy
-    if args.pretrained: imgs.mul_(torch.tensor([0.229, 0.224, 0.225], device=args.device).view(1,3,1,1))\
-                            .add_(torch.tensor([0.485, 0.456, 0.406], device=args.device).view(1,3,1,1))
-    imgs = imgs.cpu().permute(0,2,3,1).data.numpy()
-    masks = masks.cpu().permute(0,2,3,1).data.numpy()
-    labels = labels.cpu().data.numpy()
-    probs = scores.sigmoid().cpu().data.numpy()
-
-    # 5. make grid of [model prob, original image, grad-cam image] for each attr
-    offset = 0
-    for attr, idxs_ in zip(attr_names + ['No findings', '2 conditions', 'Multiple conditions'], idxs):
+    # 3. make column grid of [model probs table, original image, grad-cam image] for each attr + other categories
+    for attr, vis_idxs in zip(dataloader.dataset.vis_attrs, dataloader.dataset.vis_idxs):
         fig, axs = plt.subplots(3, 3, figsize=(4 * imgs.shape[1]/100, 3.3 * imgs.shape[2]/100), dpi=100, frameon=False)
         fig.suptitle(attr)
-        for i in range(len(idxs_)):
+        for i, idx in enumerate(vis_idxs):
+            offset = idxs.index(idx)
             visualize_one(model, imgs[offset], masks[offset], labels[offset], patient_ids[offset], probs[offset], attr_names, axs[i])
-            offset += 1
 
         filename = 'vis_{}_step_{}.png'.format(attr.replace(' ', '_'), args.step)
         plt.savefig(os.path.join(args.output_dir, 'vis', filename), dpi=100)
@@ -397,10 +360,46 @@ def visualize_one(model, img, mask, label, patient_id, prob, attr_names, axs):
 
     for ax in axs: ax.axis('off')
 
+def vis_attn(x, patient_ids, idxs, attn_layers, args, batch_element=0):
+    H, W = x.shape[2:]
+    nh = attn_layers[0].nh
+
+    # select which pixels to visualize -- e.g. select virtices of a center square of side 1/3 of the image dims
+    pix_to_vis = lambda h, w: [(h//3, w//3), (h//3, int(2*w/3)), (int(2*h/3), w//3), (int(2*h/3), int(2*w/3))]
+    window = 30  # take mean attn around the pix_to_vis in a window of size ws
+
+    for j, l in enumerate(attn_layers):
+        # visualize attention maps (rows for each head; columns for each pixel)
+        fig, axs = plt.subplots(nh+1, 4, figsize=(3,3/4*(1+nh)), frameon=False)
+        fig.suptitle(patient_ids[batch_element], fontsize=8)
+        # display target image; highlight pixel
+        for ax, (ph, pw) in zip(axs[0], pix_to_vis(H,W)):
+            image = x.clone().detach().mul_(0.0349).add_(0.5330)  # renormalize
+            image[:,:,ph-window:ph+window,pw-window:pw+window] = torch.tensor([1., 215/255, 0]).view(1,3,1,1)   # add yellow pixel on the pix_to_vis for visualization
+            ax.imshow(image[batch_element].permute(1,2,0).numpy())
+            ax.axis('off')
+        # display attention maps
+        # get attention weights tensor for the batch element
+        attn = l.weights.data[batch_element]
+        # reshape attn tensor and select the pixels to visualize
+        h = w = int(np.sqrt(attn.shape[-1]))
+        ws = max(1, int(window * h/H))  # scale window to feature map size
+        attn = attn.reshape(nh, h, w, h, w)
+        for i, (ph, pw) in enumerate(pix_to_vis(h,w)):
+            for h in range(nh):
+                axs[h+1, i].imshow(attn[h, ph-ws:ph+ws, pw-ws:pw+ws, :, :].mean([0,1]).cpu().numpy())
+                axs[h+1, i].axis('off')
+
+
+        filename = 'attn_image_idx_{}_{}_layer_{}.png'.format(idxs[batch_element], batch_element, j)
+        fig.subplots_adjust(0,0,1,0.95,0.05,0.05)
+        plt.savefig(os.path.join(args.output_dir, 'vis', filename))
+        plt.close()
+
 def plot_roc(metrics, args, filename, labels=ChexpertSmall.attr_names):
     fig, axs = plt.subplots(2, len(labels), figsize=(24,12))
 
-    for i, (fpr, tpr, aucs, precision, recall, label) in enumerate(zip(metrics['fpr'].values(), metrics['tpr'].values(), 
+    for i, (fpr, tpr, aucs, precision, recall, label) in enumerate(zip(metrics['fpr'].values(), metrics['tpr'].values(),
                                                                        metrics['aucs'].values(), metrics['precision'].values(),
                                                                        metrics['recall'].values(), labels)):
         # top row -- ROC
@@ -449,6 +448,7 @@ if __name__ == '__main__':
 
     # save config
     if not os.path.exists(os.path.join(args.output_dir, 'config.json')): save_json(args.__dict__, 'config', args)
+    writer.add_text('config', str(args.__dict__))
 
     args.device = torch.device('cuda:{}'.format(args.cuda) if args.cuda is not None and torch.cuda.is_available() else 'cpu')
 
@@ -459,37 +459,54 @@ if __name__ == '__main__':
     # load model
     n_classes = len(ChexpertSmall.attr_names)
     if args.model=='densenet121':
-        model = densenet121(pretrained=args.pretrained)
+        model = densenet121(pretrained=args.pretrained).to(args.device)
         # 1. replace output layer with chexpert number of classes (pretrained loads ImageNet n_classes)
-        model.classifier = nn.Linear(model.classifier.in_features, out_features=n_classes)
+        model.classifier = nn.Linear(model.classifier.in_features, out_features=n_classes).to(args.device)
         # 2. init output layer with default torchvision init
         nn.init.constant_(model.classifier.bias, 0)
         # 3. store locations of forward and backward hooks for grad-cam
-        args.hooks = {'forward': model.features.norm5, 'backward': model.classifier}
+        grad_cam_hooks = {'forward': model.features.norm5, 'backward': model.classifier}
         # 4. init optimizer and scheduler
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = None
+#        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=True)
+#        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [40000, 60000])
+    elif args.model=='aadensenet121':
+        model = DenseNet(32, (6, 12, 24, 16), 64, num_classes=n_classes,
+                         attn_params={'k': 0.2, 'v': 0.1, 'nh': 8, 'relative': True, 'input_dims': (320,320)}).to(args.device)
+        grad_cam_hooks = {'forward': model.features, 'backward': model.classifier}
+        attn_hooks = [model.features.transition1.conv, model.features.transition2.conv, model.features.transition3.conv]
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=True)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [40000, 60000])
     elif args.model=='resnet152':
-        model = resnet152(pretrained=args.pretrained)
-        model.fc = nn.Linear(model.fc.in_features, out_features=n_classes)
-        args.hooks = {'forward': model.layer4, 'backward': model.fc}
+        model = resnet152(pretrained=args.pretrained).to(args.device)
+        model.fc = nn.Linear(model.fc.in_features, out_features=n_classes).to(args.device)
+        grad_cam_hooks = {'forward': model.layer4, 'backward': model.fc}
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = None
+    elif args.model=='aaresnet152':  # resnet50 layers [3,4,6,3]; resnet101 layers [3,4,23,3]; resnet 152 layers [3,8,36,3]
+        model = ResNet(Bottleneck, [3, 8, 36, 3], num_classes=n_classes,
+                         attn_params={'k': 0.2, 'v': 0.1, 'nh': 8, 'relative': True, 'input_dims': (320,320)}).to(args.device)
+        grad_cam_hooks = {'forward': model.layer4, 'backward': model.fc}
+        attn_hooks = [model.layer2[i].conv2 for i in range(len(model.layer2))] + \
+                     [model.layer3[i].conv2 for i in range(len(model.layer3))] + \
+                     [model.layer4[i].conv2 for i in range(len(model.layer4))]
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = None
     elif 'efficientnet' in args.model:
-        model = construct_model(args.model, n_classes=n_classes)
-        args.hooks = {'forward': model.head[1], 'backward': model.head[-1]}
+        model = construct_model(args.model, n_classes=n_classes).to(args.device)
+        grad_cam_hooks = {'forward': model.head[1], 'backward': model.head[-1]}
         optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, momentum=0.9, eps=0.001)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, partial(build_lr, mode=args.lr_mode, warmup_steps=args.lr_warmup_steps,
-                                                                                   decay_steps=args.lr_decay_steps))
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, args.lr_decay_factor)
     else:
         raise RuntimeError('Model architecture not supported.')
-    model = model.to(args.device)
 
     if args.restore and os.path.isfile(args.restore):  # restore from single file, else ensemble is handled by evaluate_ensemble
         print('Restoring model weights from {}'.format(args.restore))
         model_checkpoint = torch.load(args.restore, map_location=args.device)
         model.load_state_dict(model_checkpoint['state_dict'])
         args.step = model_checkpoint['global_step']
+        del model_checkpoint
         # if training, load optimizer and scheduler too
         if args.train:
             print('Restoring optimizer.')
@@ -507,14 +524,16 @@ if __name__ == '__main__':
         args.pretrained = load_json(os.path.join(args.output_dir, 'config.json'))['pretrained']
     train_dataloader = fetch_dataloader(args, mode='train')
     valid_dataloader = fetch_dataloader(args, mode='valid')
+    vis_dataloader = fetch_dataloader(args, mode='vis')
 
     # setup loss function for train and eval
     loss_fn = nn.BCEWithLogitsLoss(reduction='none').to(args.device)
 
     print('Loaded {} (number of parameters: {:,}; weights trained to step {})'.format(
         model._get_name(), sum(p.numel() for p in model.parameters()), args.step))
-    print('Train data length: ', len(train_dataloader) * args.batch_size)
-    print('Valid data length: ', len(valid_dataloader) * args.batch_size)
+    print('Train data length: ', len(train_dataloader.dataset))
+    print('Valid data length: ', len(valid_dataloader.dataset))
+    print('Vis data subset: ', len(vis_dataloader.dataset))
 
     if args.train:
         train_and_evaluate(model, train_dataloader, valid_dataloader, loss_fn, optimizer, scheduler, writer, args)
@@ -527,6 +546,7 @@ if __name__ == '__main__':
         save_json(eval_metrics, 'eval_results_step_{}'.format(args.step), args)
 
     if args.evaluate_ensemble:
+        assert os.path.isdir(args.restore), 'Restore argument must be directory with saved checkpoints'
         eval_metrics = evaluate_ensemble(model, valid_dataloader, loss_fn, args)
         print('Evaluate ensemble metrics -- \n\t checkpoints path {}:'.format(args.restore))
         print('AUC:\n', pprint.pformat(eval_metrics['aucs']))
@@ -534,7 +554,13 @@ if __name__ == '__main__':
         save_json(eval_metrics, 'eval_results_ensemble', args)
 
     if args.visualize:
-        visualize(model, valid_dataloader, args)
+        visualize(model, vis_dataloader, grad_cam_hooks, args)
+        if attn_hooks is not None:
+            for x, _, idxs in vis_dataloader:
+                model(x.to(args.device))
+                patient_ids = extract_patient_ids(vis_dataloader.dataset, idxs)
+                # visualize stored attention weights for each image
+                for i in range(len(x)): vis_attn(x, patient_ids, idxs, attn_hooks, args, i)
 
     if args.plot_roc:
         # load results files from output_dir
