@@ -6,6 +6,7 @@ import json
 import math
 
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 from PIL import Image
 
@@ -34,6 +35,7 @@ class ChexpertSmall(Dataset):
         if mode == 'test':
             self.data = pd.read_csv(self.root, keep_default_na=True)
             self.root = '.'  # base path; to be joined to filename in csv file in __getitem__
+            self.data[self.attr_names] = pd.DataFrame(np.zeros((len(self.data), len(self.attr_names))))  # attr is vector of 0s under test
         else:
             self._maybe_download_and_extract()
             self._maybe_process(data_filter)
@@ -65,24 +67,24 @@ class ChexpertSmall(Dataset):
                 idxs_flatten = torch.tensor([i for sublist in idxs for i in sublist])
                 self.data = self.data.iloc[idxs_flatten]
 
+        # store index of the selected attributes in the columns of the data for faster indexing
+        self.attr_idxs = [self.data.columns.tolist().index(a) for a in self.attr_names]
+
     def __getitem__(self, idx):
         # 1. select and load image
-        img_path = self.data['Path'].iloc[idx]
+        img_path = self.data.iloc[idx, 0]  # 'Path' column is 0
         img = Image.open(os.path.join(self.root, img_path))
         if self.transform is not None:
             img = self.transform(img)
 
         # 2. select attributes as targets
-        # NOTE attr is a vector of 0s under the test
-        attr = torch.zeros(len(self.attr_names))
-        if self.mode != 'test':
-            attr = self.data[self.attr_names].iloc[idx].values
-            attr = torch.tensor(attr).float()
+        attr = self.data.iloc[idx, self.attr_idxs].values.astype(np.float32)
+        attr = torch.from_numpy(attr)
 
         # 3. save index for extracting the patient_id in prediction/eval results as 'CheXpert-v1.0-small/valid/patient64541/study1'
         #    performed using the extract_patient_ids function
-        idx = torch.tensor(self.data.index[idx])  # idx is based on len(self.data); if we are taking a subset of the data, idx will be relative to len(subset);
-                                                  # self.data.index(idx) pull the index in the original dataframe and not the subset
+        idx = self.data.index[idx]  # idx is based on len(self.data); if we are taking a subset of the data, idx will be relative to len(subset);
+                                    # self.data.index(idx) pulls the index in the original dataframe and not the subset
 
         return img, attr, idx
 

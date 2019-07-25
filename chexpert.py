@@ -66,15 +66,15 @@ def fetch_dataloader(args, mode):
 
     transforms = T.Compose([
         T.Resize(args.resize) if args.resize else T.Lambda(lambda x: x),
-        T.CenterCrop(320),
-        T.ToTensor(),
-        T.Normalize(mean=[0.5330], std=[0.0349]),   # whiten with dataset mean and std
-        T.Lambda(lambda x: x.expand(3,-1,-1))])     # expand to 3 channels
+        T.CenterCrop(320 if not args.resize else args.resize),
+        lambda x: torch.from_numpy(np.array(x, copy=True)).float().div(255).unsqueeze(0),   # tensor in [0,1]
+        T.Normalize(mean=[0.5330], std=[0.0349]),                                           # whiten with dataset mean and std
+        lambda x: x.expand(3,-1,-1)])                                                       # expand to 3 channels
 
     dataset = ChexpertSmall(args.data_path, mode, transforms, mini_data=args.mini_data)
 
     return DataLoader(dataset, args.batch_size, shuffle=(mode=='train'), pin_memory=(args.device.type=='cuda'),
-                      num_workers=0 if mode=='valid' else 4)  # since evaluating the valid_dataloader is called inside the
+                      num_workers=0 if mode=='valid' else 16)  # since evaluating the valid_dataloader is called inside the
                                                               # train_dataloader loop, 0 workers for valid_dataloader avoids
                                                               # forking (cf torch dataloader docs); else memory sharing gets clunky
 
@@ -162,7 +162,7 @@ def train_epoch(model, train_dataloader, valid_dataloader, loss_fn, optimizer, s
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if scheduler and args.step >= args.warmup_steps: scheduler.step()
+            if scheduler and args.step >= args.lr_warmup_steps: scheduler.step()
 
             pbar.set_postfix(loss = '{:.4f}'.format(loss.item()))
             pbar.update()
