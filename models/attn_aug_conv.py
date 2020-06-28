@@ -80,8 +80,8 @@ class AAConv2d(nn.Module):
             # repeat for heigh dim by transposing H,W and then permuting output
             h_rel_logits = self.relative_logits_1d(q.transpose(2,3), self.key_rel_h)   # (B, nh, W, W, H, H)
             # permute and reshape for adding to the attention logits
-            h_rel_logits = h_rel_logits.permute(0,1,2,4,3,5).reshape(B, self.nh, H*W, H*W)
-            w_rel_logits = w_rel_logits.permute(0,1,4,2,5,3).reshape(B, self.nh, H*W, H*W)
+            w_rel_logits = w_rel_logits.permute(0,1,2,4,3,5).reshape(B, self.nh, H*W, H*W)
+            h_rel_logits = h_rel_logits.permute(0,1,4,2,5,3).reshape(B, self.nh, H*W, H*W)
             # add to attention logits
             logits += h_rel_logits + w_rel_logits
         self.weights = F.softmax(logits, -1)
